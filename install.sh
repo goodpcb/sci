@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Sing-Box (>=1.14) + Caddy 生产加固版全自动部署脚本 (v5)
-# 针对痛点强化:
-#  1. GitHub API / Release 镜像 Fallback 下载机制
-#  2. 核心配置文件与凭证严格设为 600/700 权限
-#  3. systemd 启动前增加 sing-box check 预检防护
-#  4. 内置 sb-sync-cert 证书热同步与一键状态切换命令
+# Sing-Box (>=1.14) + Caddy 生产加固版全自动部署脚本 (v5.1 Release)
 # ==============================================================================
 
 set -e
@@ -32,7 +27,7 @@ esac
 
 clear
 echo "=================================================================="
-echo " Sing-Box (1.14+) + Caddy 生产加固版 (集成 Fallback & 权限加固)   "
+echo " Sing-Box (1.14+) + Caddy 生产加固版 (v5.1 最终发布版)            "
 echo "=================================================================="
 echo ""
 
@@ -80,7 +75,7 @@ curl -1sLF 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmo
 curl -1sLF 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
 apt-get update -y && apt-get install -y caddy
 
-# 4. 下载 Sing-Box (改进点 1: 带镜像 Fallback)
+# 4. 下载 Sing-Box (加固: 带超时与镜像 Fallback)
 info "获取 Sing-Box 版本信息..."
 LATEST_TAG=$(curl -s4m 8 https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name 2>/dev/null || echo "")
 if [[ -z "$LATEST_TAG" || "$LATEST_TAG" == "null" ]]; then
@@ -93,9 +88,9 @@ DOWNLOAD_URL="https://github.com/SagerNet/sing-box/releases/download/${LATEST_TA
 MIRROR_URL="https://ghfast.top/${DOWNLOAD_URL}"
 
 info "正在下载 Sing-Box $LATEST_TAG..."
-if ! curl -Lo /tmp/sing-box.tar.gz --fail "$DOWNLOAD_URL"; then
+if ! curl -Lo /tmp/sing-box.tar.gz --fail -m 180 --connect-timeout 15 "$DOWNLOAD_URL"; then
     warn "官方 GitHub Releases 下载超时/失败，正在尝试通过镜像源加速下载..."
-    curl -Lo /tmp/sing-box.tar.gz --fail "$MIRROR_URL" || err "Sing-box 核心下载失败，请检查网络！"
+    curl -Lo /tmp/sing-box.tar.gz --fail -m 180 --connect-timeout 15 "$MIRROR_URL" || err "Sing-box 核心下载失败，请检查网络！"
 fi
 
 tar -xzf /tmp/sing-box.tar.gz -C /tmp
@@ -103,7 +98,7 @@ mv /tmp/sing-box-${SB_VER}-linux-${SB_ARCH}/sing-box /usr/local/bin/sing-box
 chmod +x /usr/local/bin/sing-box
 rm -rf /tmp/sing-box*
 
-# 5. 生成凭证
+# 5. 生成凭证并落盘真实主域名
 info "生成各协议独立 UUID 及凭证..."
 UUID_H2=$(cat /proc/sys/kernel/random/uuid)
 UUID_GRPC=$(cat /proc/sys/kernel/random/uuid)
@@ -116,6 +111,10 @@ KEY_PAIR=$(/usr/local/bin/sing-box generate reality-keypair)
 REALITY_PRIVATE_KEY=$(echo "$KEY_PAIR" | grep -i "PrivateKey:" | awk '{print $2}')
 REALITY_PUBLIC_KEY=$(echo "$KEY_PAIR" | grep -i "PublicKey:" | awk '{print $2}')
 REALITY_SHORT_ID=$(openssl rand -hex 8)
+
+mkdir -p /etc/sing-box /etc/sing-box/cert
+echo "$DOMAIN" > /etc/sing-box/domain.txt
+chmod 600 /etc/sing-box/domain.txt
 
 # 6. 伪装网页
 mkdir -p /var/www/html
@@ -174,9 +173,8 @@ systemctl daemon-reload
 systemctl enable --now caddy
 systemctl restart caddy
 
-# 8. 轮询证书 (改进点 2: 严格 120 秒及全量 Fallback)
+# 8. 轮询证书 (120 秒 + 兜底注入 allowInsecure)
 CERT_DIR="/etc/sing-box/cert"
-mkdir -p "$CERT_DIR"
 
 info "等待 Caddy 申请正式 SSL 证书 (最长 120 秒)..."
 CADDY_CERT_FOUND=false
@@ -220,7 +218,6 @@ else
 fi
 
 # 9. 生成配置文件
-mkdir -p /etc/sing-box
 cat << EOF > /etc/sing-box/config.json
 {
   "log": {
@@ -318,7 +315,7 @@ cat << EOF > /etc/sing-box/config.json
 }
 EOF
 
-# 改进点 3: sing-box check 严格预检
+# 预检语法
 info "正在执行 Sing-Box 配置语法严格预检..."
 if ! /usr/local/bin/sing-box check -c /etc/sing-box/config.json; then
     err "Sing-Box 配置文件校验失败！已中断部署，请检查配置内容。"
@@ -348,12 +345,17 @@ systemctl daemon-reload
 systemctl enable --now sing-box
 systemctl restart sing-box
 
-# 改进点 4: 注册 sb-sync-cert 证书热更新命令
+# 注册 sb-sync-cert 证书热更新命令 (修复: 直接读取 domain.txt)
 cat << 'EOF' > /usr/local/bin/sb-sync-cert
 #!/usr/bin/env bash
 set -e
-DOMAIN=$(grep -o '"server_name": *"[^"]*"' /etc/sing-box/config.json 2>/dev/null | head -n 1 | awk -F'"' '{print $4}')
-[[ -z "$DOMAIN" ]] && { echo "[ERROR] 未能从 config.json 获取到域名配置！"; exit 1; }
+DOMAIN_FILE="/etc/sing-box/domain.txt"
+if [[ ! -f "$DOMAIN_FILE" ]]; then
+    echo -e "\033[31m[ERROR] 未找到 $DOMAIN_FILE，无法确定主域名！\033[0m"
+    exit 1
+fi
+DOMAIN=$(tr -d '\r\n ' < "$DOMAIN_FILE")
+[[ -z "$DOMAIN" ]] && { echo -e "\033[31m[ERROR] 域名配置为空！\033[0m"; exit 1; }
 
 echo "[INFO] 正在从 Caddy 存储目录检索 $DOMAIN 的正规证书..."
 CERT_FILE=$(find /var/lib/caddy/.local/share/caddy/certificates -type f -name "$DOMAIN.crt" 2>/dev/null | head -n 1)
@@ -365,14 +367,14 @@ if [[ -n "$CERT_FILE" && -n "$KEY_FILE" && -s "$CERT_FILE" && -s "$KEY_FILE" ]];
     chmod 644 /etc/sing-box/cert/server.crt
     chmod 600 /etc/sing-box/cert/server.key
     systemctl restart sing-box
-    echo -e "\033[32m[SUCCESS] 正式证书已成功同步至 Sing-Box，服务已重启！客户端请关闭 allowInsecure/insecure 开关。\033[0m"
+    echo -e "\033[32m[SUCCESS] 正规证书已成功同步至 Sing-Box，服务已重启！客户端请关闭 allowInsecure/insecure 开关。\033[0m"
 else
-    echo -e "\033[31m[FAILED] Caddy 证书目录暂未发现已签发的正式证书，请检查 Caddy 运行状态或稍后再试。\033[0m"
+    echo -e "\033[31m[FAILED] Caddy 证书目录暂未发现 $DOMAIN 的正式证书，请检查 Caddy 申请状态 (journalctl -u caddy -f)。\033[0m"
 fi
 EOF
 chmod +x /usr/local/bin/sb-sync-cert
 
-# 改进点 2: 严格加固文件权限为 600 / 700
+# 加固权限
 chmod 700 /etc/sing-box
 chmod 700 /etc/sing-box/cert
 chmod 600 /etc/sing-box/cert/server.key
