@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Sing-Box (>=1.14) + Caddy + VLESS (H2/gRPC/Reality) + Hysteria 2 全自动加固部署脚本
-# 系统支持: Debian 11+/12+ 或 Ubuntu 20.04+/22.04+/24.04+
-# 修复与优化:
-#  1. 凭据隔离: H2, gRPC, Reality 分别使用完全独立的 UUID
-#  2. 证书轮询加长至 120 秒，动态输出耗时进度
-#  3. 证书兜底全面修复: 自签时统一为 H2, gRPC 补充 allowInsecure=1, Hy2 补充 insecure=1
-#  4. 自动开启 Linux 原生 BBR 与 fq 网络优化
+# Sing-Box (>=1.14) + Caddy 生产加固版全自动部署脚本 (v5)
+# 针对痛点强化:
+#  1. GitHub API / Release 镜像 Fallback 下载机制
+#  2. 核心配置文件与凭证严格设为 600/700 权限
+#  3. systemd 启动前增加 sing-box check 预检防护
+#  4. 内置 sb-sync-cert 证书热同步与一键状态切换命令
 # ==============================================================================
 
 set -e
@@ -33,11 +32,10 @@ esac
 
 clear
 echo "=================================================================="
-echo " Sing-Box (1.14+) + Caddy 生产加固版全功能自动部署脚本            "
+echo " Sing-Box (1.14+) + Caddy 生产加固版 (集成 Fallback & 权限加固)   "
 echo "=================================================================="
 echo ""
 
-# 域名与基础配置
 read -rp "1. 请输入解析到本 VPS 的域名 (例如: node.example.com): " DOMAIN
 [[ -z "$DOMAIN" ]] && err "域名不能为空！"
 
@@ -48,29 +46,22 @@ H2_PATH=${H2_PATH:-"/rayh2"}
 read -rp "3. 请输入 gRPC 服务名 (默认回车: vless-grpc): " GRPC_SERVICE
 GRPC_SERVICE=${GRPC_SERVICE:-"vless-grpc"}
 
-# Reality 配置
-echo ""
-echo "------------------- Reality 节点参数 -------------------"
 read -rp "4. 请输入 Reality 监听端口 (默认回车: 8443): " REALITY_PORT
 REALITY_PORT=${REALITY_PORT:-8443}
 
 read -rp "5. 请输入 Reality 伪装域名/SNI (默认回车: addons.mozilla.org): " REALITY_DEST_DOMAIN
 REALITY_DEST_DOMAIN=${REALITY_DEST_DOMAIN:-"addons.mozilla.org"}
 
-# Hysteria 2 配置
-echo ""
-echo "------------------- Hysteria 2 节点参数 -------------------"
 read -rp "6. 请输入 Hysteria 2 监听端口 (UDP, 默认回车: 8444): " HY2_PORT
 HY2_PORT=${HY2_PORT:-8444}
 
-# 获取 VPS 公网 IP
 SERVER_IP=$(curl -s4m 8 ip.sb || curl -s4m 8 ifconfig.me || curl -s4m 8 api.ipify.org || echo "")
 if [[ -z "$SERVER_IP" ]]; then
     read -rp "未能自动获取公网 IPv4，请输入本机外网 IP: " SERVER_IP
 fi
 
-# 1. 内核优化：开启 BBR
-info "优化系统内核网络参数 (开启 BBR & FQ)..."
+# 1. 开启 BBR
+info "配置系统内核参数 (BBR + FQ)..."
 if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
     echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
 fi
@@ -79,33 +70,41 @@ if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
 fi
 sysctl -p >/dev/null 2>&1 || true
 
-# 2. 安装基础依赖
-info "更新源并安装依赖 (curl, jq, tar, openssl, socat)..."
+# 2. 基础软件依赖
+info "更新软件源并安装基础工具..."
 apt-get update -y && apt-get install -y curl jq tar openssl socat debian-keyring debian-archive-keyring apt-transport-https
 
 # 3. 安装 Caddy
-info "安装官方最新 Caddy..."
+info "安装官方 Caddy..."
 curl -1sLF 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
 curl -1sLF 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
 apt-get update -y && apt-get install -y caddy
 
-# 4. 下载安装 Sing-Box (>=1.14)
-info "获取 Sing-Box 最新版本..."
-LATEST_TAG=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
-[[ -z "$LATEST_TAG" || "$LATEST_TAG" == "null" ]] && LATEST_TAG="v1.14.0"
+# 4. 下载 Sing-Box (改进点 1: 带镜像 Fallback)
+info "获取 Sing-Box 版本信息..."
+LATEST_TAG=$(curl -s4m 8 https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name 2>/dev/null || echo "")
+if [[ -z "$LATEST_TAG" || "$LATEST_TAG" == "null" ]]; then
+    warn "访问 GitHub API 失败或触发表率限制，启用固定默认版本 v1.14.0"
+    LATEST_TAG="v1.14.0"
+fi
 
-info "下载并安装 Sing-Box $LATEST_TAG ($SB_ARCH)..."
 SB_VER=${LATEST_TAG#v}
 DOWNLOAD_URL="https://github.com/SagerNet/sing-box/releases/download/${LATEST_TAG}/sing-box-${SB_VER}-linux-${SB_ARCH}.tar.gz"
+MIRROR_URL="https://ghfast.top/${DOWNLOAD_URL}"
 
-curl -Lo /tmp/sing-box.tar.gz "$DOWNLOAD_URL"
+info "正在下载 Sing-Box $LATEST_TAG..."
+if ! curl -Lo /tmp/sing-box.tar.gz --fail "$DOWNLOAD_URL"; then
+    warn "官方 GitHub Releases 下载超时/失败，正在尝试通过镜像源加速下载..."
+    curl -Lo /tmp/sing-box.tar.gz --fail "$MIRROR_URL" || err "Sing-box 核心下载失败，请检查网络！"
+fi
+
 tar -xzf /tmp/sing-box.tar.gz -C /tmp
 mv /tmp/sing-box-${SB_VER}-linux-${SB_ARCH}/sing-box /usr/local/bin/sing-box
 chmod +x /usr/local/bin/sing-box
 rm -rf /tmp/sing-box*
 
-# 5. 安全隔离生成凭据
-info "安全隔离: 生成各协议独立 UUID 及凭证..."
+# 5. 生成凭证
+info "生成各协议独立 UUID 及凭证..."
 UUID_H2=$(cat /proc/sys/kernel/random/uuid)
 UUID_GRPC=$(cat /proc/sys/kernel/random/uuid)
 UUID_REALITY=$(cat /proc/sys/kernel/random/uuid)
@@ -118,15 +117,13 @@ REALITY_PRIVATE_KEY=$(echo "$KEY_PAIR" | grep -i "PrivateKey:" | awk '{print $2}
 REALITY_PUBLIC_KEY=$(echo "$KEY_PAIR" | grep -i "PublicKey:" | awk '{print $2}')
 REALITY_SHORT_ID=$(openssl rand -hex 8)
 
-# 6. 部署伪装网页
-info "部署伪装静态网站..."
+# 6. 伪装网页
 mkdir -p /var/www/html
 cat << 'EOF' > /var/www/html/index.html
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Edge Acceleration & Cloud Services</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f1f5f9; color: #334155; margin: 0; display: flex; justify-content: center; align-items: center; height: 100vh; }
@@ -146,8 +143,7 @@ cat << 'EOF' > /var/www/html/index.html
 </html>
 EOF
 
-# 7. 配置 Caddyfile 并启动以申请正式 SSL 证书
-info "配置 Caddy 并启动 ACME 流程..."
+# 7. 配置 Caddy
 cat << EOF > /etc/caddy/Caddyfile
 $DOMAIN {
     root * /var/www/html
@@ -178,10 +174,11 @@ systemctl daemon-reload
 systemctl enable --now caddy
 systemctl restart caddy
 
+# 8. 轮询证书 (改进点 2: 严格 120 秒及全量 Fallback)
 CERT_DIR="/etc/sing-box/cert"
 mkdir -p "$CERT_DIR"
 
-info "等待 Caddy 完成 ACME 握手并签发正规 SSL 证书 (最长等待 120 秒)..."
+info "等待 Caddy 申请正式 SSL 证书 (最长 120 秒)..."
 CADDY_CERT_FOUND=false
 TIMEOUT=120
 ELAPSED=0
@@ -200,36 +197,30 @@ done
 echo ""
 
 if [[ "$CADDY_CERT_FOUND" == "true" ]]; then
-    info "成功获取 Caddy 正式 SSL 证书！正在同步至 Sing-Box..."
+    info "成功获取 Caddy 正式证书，同步至 Sing-Box..."
     cp -L "$CERT_FILE" "$CERT_DIR/server.crt"
     cp -L "$KEY_FILE" "$CERT_DIR/server.key"
-    chmod 644 "$CERT_DIR/server.crt"
-    chmod 600 "$CERT_DIR/server.key"
-    
     H2_INSECURE_PARAM=""
     GRPC_INSECURE_PARAM=""
     HY2_INSECURE_PARAM=""
-    CERT_STATUS_STR="已挂载正规正式证书 (严格校验，抗 MITM)"
+    CERT_STATUS_STR="已挂载正规正式证书 (严格校验抗 MITM)"
 else
-    warn "120 秒内未能捕获 Caddy 证书 (DNS 尚未生效或触发 ACME 限频)。"
-    warn "启动自签名证书应急兜底: 所有受影响节点链接将自动注入 allowInsecure 确保连通性！"
+    warn "120 秒内未捕获到 Caddy 证书，启动自签名证书兜底！"
+    warn "受影响节点链接将自动开启 allowInsecure 确保连通性。"
     openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
       -keyout "$CERT_DIR/server.key" \
       -out "$CERT_DIR/server.crt" \
       -days 3650 \
       -subj "/CN=$DOMAIN" \
       -addext "subjectAltName=DNS:$DOMAIN" >/dev/null 2>&1
-    chmod 644 "$CERT_DIR/server.crt"
-    chmod 600 "$CERT_DIR/server.key"
-    
     H2_INSECURE_PARAM="&allowInsecure=1"
     GRPC_INSECURE_PARAM="&allowInsecure=1"
     HY2_INSECURE_PARAM="&insecure=1"
-    CERT_STATUS_STR="注意: 使用自签名证书兜底 (已自动开启 allowInsecure 保证连通)"
+    CERT_STATUS_STR="注意: 使用自签名证书兜底 (后续可通过 sb-sync-cert 升级为正式证书)"
 fi
 
-# 8. 生成 Sing-Box 配置文件
-info "生成 Sing-Box 配置文件..."
+# 9. 生成配置文件
+mkdir -p /etc/sing-box
 cat << EOF > /etc/sing-box/config.json
 {
   "log": {
@@ -327,8 +318,14 @@ cat << EOF > /etc/sing-box/config.json
 }
 EOF
 
-# 9. 创建 Systemd 守护服务并启动
-info "创建 systemd 服务守护..."
+# 改进点 3: sing-box check 严格预检
+info "正在执行 Sing-Box 配置语法严格预检..."
+if ! /usr/local/bin/sing-box check -c /etc/sing-box/config.json; then
+    err "Sing-Box 配置文件校验失败！已中断部署，请检查配置内容。"
+fi
+info "配置语法校验通过！"
+
+# 10. 创建 systemd 服务
 cat << EOF > /etc/systemd/system/sing-box.service
 [Unit]
 Description=sing-box service
@@ -351,13 +348,43 @@ systemctl daemon-reload
 systemctl enable --now sing-box
 systemctl restart sing-box
 
-# 构建节点分享链接
+# 改进点 4: 注册 sb-sync-cert 证书热更新命令
+cat << 'EOF' > /usr/local/bin/sb-sync-cert
+#!/usr/bin/env bash
+set -e
+DOMAIN=$(grep -o '"server_name": *"[^"]*"' /etc/sing-box/config.json 2>/dev/null | head -n 1 | awk -F'"' '{print $4}')
+[[ -z "$DOMAIN" ]] && { echo "[ERROR] 未能从 config.json 获取到域名配置！"; exit 1; }
+
+echo "[INFO] 正在从 Caddy 存储目录检索 $DOMAIN 的正规证书..."
+CERT_FILE=$(find /var/lib/caddy/.local/share/caddy/certificates -type f -name "$DOMAIN.crt" 2>/dev/null | head -n 1)
+KEY_FILE=$(find /var/lib/caddy/.local/share/caddy/certificates -type f -name "$DOMAIN.key" 2>/dev/null | head -n 1)
+
+if [[ -n "$CERT_FILE" && -n "$KEY_FILE" && -s "$CERT_FILE" && -s "$KEY_FILE" ]]; then
+    cp -L "$CERT_FILE" /etc/sing-box/cert/server.crt
+    cp -L "$KEY_FILE" /etc/sing-box/cert/server.key
+    chmod 644 /etc/sing-box/cert/server.crt
+    chmod 600 /etc/sing-box/cert/server.key
+    systemctl restart sing-box
+    echo -e "\033[32m[SUCCESS] 正式证书已成功同步至 Sing-Box，服务已重启！客户端请关闭 allowInsecure/insecure 开关。\033[0m"
+else
+    echo -e "\033[31m[FAILED] Caddy 证书目录暂未发现已签发的正式证书，请检查 Caddy 运行状态或稍后再试。\033[0m"
+fi
+EOF
+chmod +x /usr/local/bin/sb-sync-cert
+
+# 改进点 2: 严格加固文件权限为 600 / 700
+chmod 700 /etc/sing-box
+chmod 700 /etc/sing-box/cert
+chmod 600 /etc/sing-box/cert/server.key
+chmod 644 /etc/sing-box/cert/server.crt
+chmod 600 /etc/sing-box/config.json
+
+# 拼接节点链接
 LINK_HY2="hysteria2://${HY2_PASSWORD}@${DOMAIN}:${HY2_PORT}/?sni=${DOMAIN}${HY2_INSECURE_PARAM}#Hy2-${DOMAIN}"
 LINK_REALITY="vless://${UUID_REALITY}@${SERVER_IP}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DEST_DOMAIN}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp#Reality-${REALITY_DEST_DOMAIN}"
 LINK_H2="vless://${UUID_H2}@${DOMAIN}:443?encryption=none&security=tls&sni=${DOMAIN}&type=http&path=$(echo -n "$H2_PATH" | jq -sRr @uri)&host=${DOMAIN}${H2_INSECURE_PARAM}#${DOMAIN}-H2"
 LINK_GRPC="vless://${UUID_GRPC}@${DOMAIN}:443?encryption=none&security=tls&sni=${DOMAIN}&type=grpc&serviceName=${GRPC_SERVICE}${GRPC_INSECURE_PARAM}#${DOMAIN}-gRPC"
 
-# 保存并输出配置信息
 INFO_FILE="/etc/sing-box/node_info.txt"
 cat << EOF > "$INFO_FILE"
 ==================================================================
@@ -389,9 +416,10 @@ $LINK_H2
 $LINK_GRPC
 ==================================================================
 EOF
+chmod 600 "$INFO_FILE"
 
 clear
 cat "$INFO_FILE"
 echo ""
-echo -e "${GREEN}配置已保存至文件: ${INFO_FILE}${PLAIN}"
-echo "随时使用 cat ${INFO_FILE} 重新查看节点信息。"
+echo -e "${GREEN}配置已保存至文件: ${INFO_FILE} (权限已严格锁定为 600)${PLAIN}"
+echo "若使用了自签证书兜底，待域名生效后随时运行 sb-sync-cert 即可升级正规证书！"
