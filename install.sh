@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# v5.2.1: umask-safe certificate/web permissions and diagnostic fixes.
 # v5.2: Caddy + Reality + Hysteria2; H2/gRPC optional; uninstall supported.
 # Requires Debian 12/13 or Ubuntu 22.04/24.04, systemd, amd64/arm64.
 # bash install.sh --help
@@ -67,7 +68,7 @@ import time
 import urllib.parse
 import uuid
 
-VERSION = '5.2'
+VERSION = '5.2.1'
 DEFAULT_SB = '1.14.3'
 PINNED = {
     'amd64': 'e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee',
@@ -89,12 +90,17 @@ SERVICES = ['caddy', 'sing-box', 'sb-v52-cert-sync.timer']
 
 
 def log(message):
-    print('[v5.2] ' + message, flush=True)
+    print('[v' + VERSION + '] ' + message, flush=True)
 
 
 def run(*args, check=True, capture=False, timeout=60, **kwargs):
-    return subprocess.run([str(a) for a in args], check=check, timeout=timeout,
-                          text=True, capture_output=capture, **kwargs)
+    try:
+        return subprocess.run([str(a) for a in args], check=check, timeout=timeout,
+                              text=True, capture_output=capture, **kwargs)
+    except subprocess.CalledProcessError as e:
+        if e.stderr:
+            print(e.stderr, end='', file=sys.stderr, flush=True)
+        raise
 
 
 def atomic(path, data, mode=0o600, group=None):
@@ -360,12 +366,28 @@ def find_cert(hostname):
     raise ValueError('未找到有效的受信任 Caddy 证书；检查 DNS、80/443、防火墙和 Caddy 日志')
 
 
+
+def prepare_web():
+    # The process umask is 077: mkdir(mode=...) alone cannot grant access.
+    parent = WEB.parent
+    if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
+        raise ValueError('网站父目录必须是普通目录：' + str(parent))
+    parent.mkdir(parents=True, exist_ok=True)
+    # Add traversal only to an existing shared parent; preserve other mode bits.
+    parent.chmod((parent.stat().st_mode & 0o7777) | 0o111)
+    WEB.mkdir(parents=True, exist_ok=True)
+    WEB.chmod(0o755)
+
+
 def publish_cert(s):
     crt, key = find_cert(s['domain'])
     # Stage and revalidate a stable pair in case Caddy renewed during the copy.
+    gid = pwd.getpwnam('sing-box').pw_gid
+    BASE.mkdir(parents=True, exist_ok=True)
+    os.chown(BASE, 0, gid)
+    BASE.chmod(0o750)
     root = BASE / 'cert'
     root.mkdir(parents=True, exist_ok=True)
-    gid = pwd.getpwnam('sing-box').pw_gid
     os.chown(root, 0, gid)
     root.chmod(0o750)
     with tempfile.TemporaryDirectory(prefix='.cert-', dir=root) as tmp:
@@ -385,6 +407,7 @@ def publish_cert(s):
         target = root / ident
         target.mkdir(mode=0o750)
         os.chown(target, 0, gid)
+        target.chmod(0o750)
         atomic(target / 'server.crt', a.read_bytes(), 0o640, gid)
         atomic(target / 'server.key', b.read_bytes(), 0o640, gid)
         link = root / ('.link-' + secrets.token_hex(8))
@@ -409,6 +432,8 @@ def snapshot():
     target = BACKUPS / (time.strftime('%Y%m%d-%H%M%S') + '-' + secrets.token_hex(3))
     target.mkdir(mode=0o700)
     manifest = {'format': 1, 'paths': [], 'services': {}}
+    if WEB.parent.is_dir() and not WEB.parent.is_symlink():
+        manifest['web_parent_mode'] = WEB.parent.stat().st_mode & 0o7777
     for index, path in enumerate(MANAGED):
         exists = path.exists() or path.is_symlink()
         entry = dict(path=str(path), exists=exists, item=str(index))
@@ -451,6 +476,9 @@ def restore(target):
                 run('cp', '-a', '--', src, path)
             else:
                 run('cp', '-a', '--', src, path)
+    # Optional metadata keeps existing v5.2 backups compatible.
+    if 'web_parent_mode' in manifest and WEB.parent.is_dir() and not WEB.parent.is_symlink():
+        WEB.parent.chmod(manifest['web_parent_mode'])
     run('systemctl', 'daemon-reload')
     for unit, original in manifest['services'].items():
         # Files are restored; disabled or missing pre-install services stay disabled.
@@ -577,7 +605,10 @@ def health(s, quiet=False):
         errors.append('证书同步 timer 未运行')
     for args in [(BIN, 'check', '-c', BASE / 'config.json'),
                  ('caddy', 'validate', '--config', CADDY, '--adapter', 'caddyfile')]:
-        if run(*args, check=False, capture=True).returncode:
+        result = run(*args, check=False, capture=True)
+        if result.returncode:
+            if result.stderr:
+                log('配置检查详情：' + result.stderr.strip())
             errors.append('配置检查失败：' + str(args[0]))
     expected = [('tcp', 80, 'caddy'), ('tcp', 443, 'caddy'),
                 ('tcp', s['reality_port'], 'sing-box')]
@@ -597,6 +628,9 @@ def health(s, quiet=False):
         '--max-time', '15', '--resolve', f'{s["domain"]}:443:127.0.0.1',
         f'https://{s["domain"]}/', check=False, capture=True, timeout=20)
     if https.returncode:
+        log(f'HTTPS 检查 curl 退出码：{https.returncode}')
+        if https.stderr:
+            log('HTTPS 检查详情：' + https.stderr.strip())
         errors.append('本机 HTTPS 检查失败（未跳过证书验证）')
     if errors:
         raise ValueError('; '.join(errors))
@@ -676,8 +710,7 @@ def install(args):
             proposed_caddy = tmp / 'Caddyfile'
             atomic(proposed_caddy, caddy, 0o644)
             run('caddy', 'validate', '--config', proposed_caddy, '--adapter', 'caddyfile', capture=True)
-            WEB.mkdir(parents=True, exist_ok=True)
-            WEB.chmod(0o755)
+            prepare_web()
             atomic(WEB / 'index.html', '<!doctype html><html lang="en"><meta charset="utf-8">'
                 '<meta name="viewport" content="width=device-width,initial-scale=1">'
                 '<title>Personal site</title><body><main><h1>Welcome</h1>'
