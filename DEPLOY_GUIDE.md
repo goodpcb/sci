@@ -1,41 +1,46 @@
-# GitHub 部署与自定义域名极简调用指南
+# GitHub 仓库与 Cloudflare Workers 部署说明
 
-通过本指南，你可以将加固脚本发布到个人 GitHub 仓库，并通过 Cloudflare 实现免长链接的极简一键调用。
+本指南说明如何配合 `sci.zdxq.xyz` 与个人 GitHub 仓库实现一键脚本托管。
 
 ---
 
-## 1. 推送到 GitHub 仓库
+## 1. 提交至 GitHub 仓库
 
-1. 在 GitHub 上新建一个 **Public** 仓库（例如 `singbox-suite`）。
-2. 在解压后的目录中执行以下命令提交并推送：
+在本地或 VPS 的仓库目录中提交更新：
 
 ```bash
-git init
 git add install.sh uninstall.sh README.md DEPLOY_GUIDE.md
-git commit -m "feat: secure singbox caddy multi-protocol installer"
-git branch -M main
-git remote add origin https://github.com/<你的用户名>/<你的仓库名>.git
-git push -u origin main
-```
-
-推送后，即可通过原始链接在任何新 VPS 上运行：
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/<你的用户名>/<你的仓库名>/main/install.sh)
+git commit -m "fix: acme 120s timeout, unified fallback insecure params, safe execution"
+git push origin main
 ```
 
 ---
 
-## 2. 进阶：使用 Cloudflare Workers 绑定自己的短域名
+## 2. Cloudflare Workers 路由分发代码
 
-无需记住冗长的 GitHub Raw 链接，在 Cloudflare 创建一个免费 Worker 并绑定你的二级域名（例如 `sh.yourdomain.com`）：
+在绑定的 `sci.zdxq.xyz` Worker 中，使用以下完整代码支持安装与卸载：
 
-1. 进入 Cloudflare 控制台 -> **Workers & Pages** -> **Create application** -> **Create Worker**。
-2. 编辑代码，粘贴以下内容：
 ```javascript
 export default {
   async fetch(request) {
-    const GITHUB_RAW_URL = "https://raw.githubusercontent.com/<你的用户名>/<你的仓库名>/main/install.sh";
-    const response = await fetch(GITHUB_RAW_URL);
+    const url = new URL(request.url);
+    // 替换为你的真实 GitHub 用户名和仓库名称
+    const REPO_BASE = "https://raw.githubusercontent.com/<你的用户名>/<你的仓库名>/main";
+    
+    let targetFile = "install.sh";
+    if (url.pathname === "/uninstall" || url.pathname === "/un") {
+      targetFile = "uninstall.sh";
+    }
+
+    const githubUrl = `${REPO_BASE}/${targetFile}`;
+    const response = await fetch(githubUrl);
+
+    if (!response.ok) {
+      return new Response(`Error fetching ${targetFile} from GitHub: ${response.statusText}`, {
+        status: response.status
+      });
+    }
+
     return new Response(response.body, {
       headers: {
         "content-type": "text/plain; charset=utf-8",
@@ -44,9 +49,4 @@ export default {
     });
   }
 };
-```
-3. 在该 Worker 的 **Settings** -> **Domains & Routes** 中绑定你的自定义域名（例如 `sh.yourdomain.com`）。
-4. 今后在任意新机器上只需执行极简命令：
-```bash
-bash <(curl -fsSL https://sh.yourdomain.com)
 ```

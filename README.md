@@ -1,23 +1,22 @@
-# Sing-Box (>=1.14) + Caddy 安全加固版多协议全套套件
+# Sing-Box (>=1.14) + Caddy 生产加固版全功能套件
 
-现代化、高度自动化的 Linux VPS 代理环境一键部署工具。基于 **Sing-Box 官方最新版 (>=1.14)** 与 **Caddy v2**，集成了主流抗封锁协议，并完成了深度安全加固。
+基于 **Sing-Box 官方最新版 (>=1.14)** 与 **Caddy v2** 的现代化 VPS 代理自动部署环境。已彻底解决 ACME 证书等待超时、自签 Fallback 节点失效以及管道流式执行截断等生产痛点。
 
-本项目已接入 **Cloudflare Workers** 极简域名加速分发（`sci.zdxq.xyz`），在全新 VPS 上可直接通过超短命令实现一键安装与卸载。
+本项目通过 **Cloudflare Workers** 域名（`sci.zdxq.xyz`）完成极简安全分发。
 
 ---
 
-## 🌟 核心特性与安全加固
+## 🛡️ 核心修复与安全加固
 
-- **四合一全协议矩阵**：
-  - **VLESS-Reality**：借用大厂境外正规网站证书与 SNI 伪装，`xtls-rprx-vision` 流控，免自备有效证书，日常主力低延迟推荐。
-  - **Hysteria 2 (Hy2)**：极速 QUIC/UDP 自研拥塞控制算法，恶劣网络与晚高峰抗丢包优选。
-  - **VLESS-H2**：由 Caddy 承载自动签发有效 HTTPS 证书并回源反代，伪装度极高。
-  - **VLESS-gRPC**：高并发低资源消耗，通过 Caddy 统一分流。
-- **深度安全与凭证隔离**：
-  - **UUID 完全隔离**：H2、gRPC 与 Reality 分别使用完全独立生成的 UUID，杜绝单点泄漏风险。
-  - **Hy2 正规证书挂载**：自动挂载 Caddy 申请的正规 Let's Encrypt / ZeroSSL 证书，拒绝高风险的 `insecure=1`，杜绝中间人攻击（MITM）。
-  - **内核级加速**：脚本自动配置并开启 Linux 原生 **BBR 拥塞控制算法** 与 **FQ 队列调度**。
-  - **企业级静态伪装站**：80/443 端口自动部署专业云服务落地页，无对应协议头直接访问回源网站。
+1. **防截断安全执行**：
+   - 官方推荐命令采用先完整落盘校验再执行的方式，彻底杜绝网络抖动导致管道执行半截脚本引发系统损坏。
+2. **ACME 轮询与证书容灾**：
+   - 证书申请轮询时间放宽至 **120 秒** 并配有动态耗时显示，大幅降低 ACME 误判率。
+   - 若极端情况下触发自签兜底，**统一为 H2、gRPC 注入 `allowInsecure=1`，为 Hy2 注入 `insecure=1`**，确保全部节点绝对开箱可用。
+3. **凭据全面隔离**：
+   - `VLESS-H2`、`VLESS-gRPC`、`VLESS-Reality` 全部采用**独立随机生成的 UUID**，杜绝单点配置泄漏风险。
+4. **内核自动优化**：
+   - 自动开启 Linux 原生 **BBR 拥塞控制算法** 与 **FQ 调度队列**。
 
 ---
 
@@ -32,34 +31,18 @@
 
 ---
 
-## 🚀 极简一行命令安装与管理 (推荐)
+## 🚀 极简安全安装命令 (推荐)
 
-在全新的 VPS 终端中，切换至 `root` 权限后直接运行：
+采用**下载完整落盘 + 确认无误再执行**的两步式防截断调用：
 
 ### 1. 一键全自动安装
 ```bash
-bash <(curl -fsSL https://sci.zdxq.xyz)
+curl -fsSL https://sci.zdxq.xyz -o install.sh && bash install.sh
 ```
 
 ### 2. 一键彻底清理卸载
 ```bash
-bash <(curl -fsSL https://sci.zdxq.xyz/un)
-```
-*(或 `bash <(curl -fsSL https://sci.zdxq.xyz/uninstall)`)*
-
----
-
-## 💻 传统安装部署方式（从源码/脚本运行）
-
-```bash
-# 赋予脚本执行权限
-chmod +x install.sh uninstall.sh
-
-# 运行安装部署
-sudo ./install.sh
-
-# 卸载清理
-sudo ./uninstall.sh
+curl -fsSL https://sci.zdxq.xyz/un -o uninstall.sh && bash uninstall.sh
 ```
 
 ---
@@ -70,7 +53,7 @@ sudo ./uninstall.sh
 2. **域名解析**：在 Cloudflare 添加一条 A 记录指向 VPS 公网 IP（**请勿开启橙色云朵 CDN**，使用仅 DNS 解析模式）。
 3. **防火墙/安全组端口开放**：
    - `TCP 80` & `TCP 443`（Caddy 自动证书申请与 HTTPS 伪装）
-   - `TCP 8443`（Reality 直连，如自定义请放行对应端口）
+   - `TCP 8443`（Reality 直连）
    - `UDP 8444`（Hysteria 2，**务必放行 UDP**）
 
 ---
@@ -86,18 +69,3 @@ sudo ./uninstall.sh
 | **重启 Caddy 服务** | `systemctl restart caddy` |
 | **编辑 Sing-Box 主配置文件** | `nano /etc/sing-box/config.json` |
 | **编辑 Caddy 配置文件** | `nano /etc/caddy/Caddyfile` |
-
----
-
-## 📱 推荐客户端
-
-* **Windows**：[v2rayN](https://github.com/2dust/v2rayN)、[Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev)、[Sing-box 原生客户端](https://github.com/SagerNet/sing-box/releases)
-* **Android**：[NekoBox](https://github.com/MatsuriDayo/NekoBoxForAndroid)、[Sing-box](https://github.com/SagerNet/sing-box/releases)
-* **macOS**：[Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev)、[Sing-box](https://github.com/SagerNet/sing-box/releases)
-* **iOS**：Shadowrocket、Loon、Stash、Sing-box
-
----
-
-## ⚠️ 免责声明
-
-本项目仅供网络技术研究与学术测试使用。请遵循当地法律法规合理使用云服务器资源。
