@@ -8,6 +8,7 @@
 
 | 项目 | 当前行为 |
 | --- | --- |
+| 交互输入 | 分别打开终端读、写流，修复 `File or stream is not seekable` 错误 |
 | 协议选择 | Reality 默认启用，HY2 默认启用但可关闭；H2/gRPC 首次安装和旧版迁移默认关闭 |
 | 凭证保留 | 可识别的 v5.1 配置迁移或重复配置时，保留已有 UUID、密码、Reality 密钥和 short ID |
 | 下载检查 | 仅从官方 GitHub 下载 Sing-Box，执行前校验 SHA256；不使用第三方下载镜像 |

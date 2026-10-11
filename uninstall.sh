@@ -139,10 +139,14 @@ def preflight():
 
 def prompt(label, default='', secret=False):
     # No shell evaluation of any answer.
-    with open('/dev/tty', 'r+') as tty:
-        tty.write(f'{label} [{default}]: ')
-        tty.flush()
-        value = tty.readline()
+    # A terminal is not seekable: do not use text update mode ('r+').
+    try:
+        with open('/dev/tty', 'r', encoding='utf-8') as tty_in, open('/dev/tty', 'w', encoding='utf-8') as tty_out:
+            tty_out.write(f'{label} [{default}]: ')
+            tty_out.flush()
+            value = tty_in.readline()
+    except OSError as exc:
+        raise ValueError('需要可用的交互终端，请在交互 SSH 会话中运行脚本') from exc
     if not value:
         raise ValueError('交互输入中断')
     return value.strip() or default
